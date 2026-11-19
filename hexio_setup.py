@@ -99,9 +99,17 @@ def _make_ssl_ctx():
     return ctx
 
 
+class QueueAuthError(RuntimeError):
+    """The queue rejected the license token (401/403): retrying won't help."""
+
+
 def acquire_queue_slot(queue_url: str, token: str, hostname: str,
                        poll_interval: float = 30.0) -> str:
-    """Block until a queue slot is granted. Returns the slot_id."""
+    """Block until a queue slot is granted. Returns the slot_id.
+
+    Retries while the queue is full and on transient errors (network,
+    timeouts, 5xx). Raises QueueAuthError if the token is rejected.
+    """
     url = queue_url.rstrip("/") + "/acquire"
     ctx = _make_ssl_ctx()
 
@@ -112,17 +120,35 @@ def acquire_queue_slot(queue_url: str, token: str, hostname: str,
         req.add_header("Content-Type", "application/json")
         req.add_header("User-Agent", "hexio-setup/1.0")
 
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
-            body = json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+                body = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise QueueAuthError(
+                    f"queue rejected the license token (HTTP {exc.code}); "
+                    "it may have expired or be for a different product"
+                ) from exc
+            if exc.code < 500:
+                raise  # other client errors are bugs, not worth retrying
+            log.warning("Queue returned HTTP %d — retrying in %ds ...",
+                        exc.code, poll_interval)
+            time.sleep(poll_interval)
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            log.warning("Queue unreachable (%s) — retrying in %ds ...",
+                        exc, poll_interval)
+            time.sleep(poll_interval)
+            continue
 
-        if body["status"] == "granted":
-            log.info("Queue slot granted (slot_id=%s, %d/%d active)",
-                     body["slot_id"][:8], body["active"], body["max"])
+        if body.get("status") == "granted":
+            log.info("Queue slot granted (slot_id=%s, %s/%s active)",
+                     body["slot_id"][:8], body.get("active", "?"), body.get("max", "?"))
             return body["slot_id"]
 
-        retry = body.get("retry_after", poll_interval)
-        log.info("Queue full (%d/%d active) — retrying in %ds ...",
-                 body["active"], body["max"], retry)
+        retry = body.get("retry_after") or poll_interval
+        log.info("Queue full (%s/%s active) — retrying in %ds ...",
+                 body.get("active", "?"), body.get("max", "?"), retry)
         time.sleep(retry)
 
 
@@ -135,7 +161,7 @@ def release_queue_slot(queue_url: str, token: str, slot_id: str,
     payload = json.dumps({
         "slot_id": slot_id,
         "result": result,
-        "elapsed": elapsed,
+        "elapsed_seconds": elapsed,
     }).encode()
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Authorization", f"Bearer {token}")
@@ -145,7 +171,8 @@ def release_queue_slot(queue_url: str, token: str, slot_id: str,
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
             body = json.loads(resp.read().decode())
-        log.info("Queue slot released — %d/%d active", body["active"], body["max"])
+        log.info("Queue slot released — %s/%s active",
+                 body.get("active", "?"), body.get("max", "?"))
     except Exception as exc:
         log.warning("Failed to release queue slot: %s", exc)
 
@@ -402,7 +429,11 @@ def main() -> None:
     if queue_url:
         hostname = os.uname().nodename
         log.info("Waiting for queue slot from %s (hostname=%s) ...", queue_url, hostname)
-        slot_id = acquire_queue_slot(queue_url, queue_token, hostname)
+        try:
+            slot_id = acquire_queue_slot(queue_url, queue_token, hostname)
+        except QueueAuthError as exc:
+            log.error("Cannot join the install queue: %s", exc)
+            sys.exit(1)
 
     total_t0 = time.time()
     result = "success"
